@@ -1,25 +1,23 @@
 # Levo scan configuration.
 #
-# This file decides what gets scanned. Levo reads it and nothing else.
-# Edit it here; the next scheduled scan picks up your changes.
+# Everything here is OPTIONAL. What gets scanned is decided by which
+# repositories you granted the Scan App access to, not by this file.
+#
+# Use it only to override what is detected automatically.
 version: 1
 
 defaults:
-  # Which environment these APIs appear under on the Levo dashboard.
   env_name: staging
-  # Wall-clock limit per repository, in seconds.
   scan_timeout: 1800
 
-# One entry per repository you want scanned.
-#
-# IMPORTANT: listing a repository here is not enough. You must also grant your
-# Scan App access to it, under Settings -> Applications -> Configure.
-# Levo cannot widen that access; only you can.
+# Repositories to leave out, even though the Scan App can see them.
+exclude: []
+  # - your-org/frontend-app
+
+# Per-repository overrides. Anything omitted is detected:
+#   language  - from GitHub's language statistics
+#   app_name  - defaults to the repository name
 repositories: []
   # - repo: your-org/payments-api
   #   language: java
   #   app_name: Payments API
-  #
-  # - repo: your-org/orders-service
-  #   language: python
-  #   app_name: Orders Service

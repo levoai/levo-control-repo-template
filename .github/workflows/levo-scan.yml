@@ -12,79 +12,157 @@ concurrency:
 jobs:
   plan:
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     outputs:
       matrix: ${{ steps.build.outputs.matrix }}
       count: ${{ steps.build.outputs.count }}
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
 
-      - name: Build the scan matrix from levo-config.yml
+      # Lists what the Scan App was granted and reads language statistics.
+      # Metadata only -- this job never clones. The per-repository narrowing
+      # that matters is applied again in the scan job below.
+      - name: Read what the Scan App can see
+        id: discovery-token
+        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1
+        with:
+          app-id: ${{ secrets.SCAN_APP_ID }}
+          private-key: ${{ secrets.SCAN_APP_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+
+      - name: Build the scan matrix
         id: build
+        env:
+          GH_TOKEN: ${{ steps.discovery-token.outputs.token }}
+          CONTROL_REPO: ${{ github.repository }}
         run: |
           python3 - <<'PY'
-          import json, os, re, sys
+          import json, os, re, sys, urllib.error, urllib.request
           import yaml
 
-          # levo-config.yml is writable by anyone with push access, so every
-          # value is untrusted. Validate against allowlists and fail closed
-          # rather than passing junk into a shell or a job matrix.
-          REPO_RE = re.compile(r"^[A-Za-z0-9._-]{1,100}/[A-Za-z0-9._-]{1,100}$")
-          LANG_RE = re.compile(r"^[a-z+#]{1,12}$")
+          TOKEN = os.environ["GH_TOKEN"]
           NAME_RE = re.compile(r"^[A-Za-z0-9 ._-]{1,80}$")
+
+          # Anything atom can analyse. A repository whose main language is not
+          # here is skipped with a reason rather than scanned pointlessly.
+          ALIASES = {
+              "c#": "csharp", "csharp": "csharp", ".net": "csharp", "dotnet": "csharp",
+              "javascript": "javascript", "typescript": "typescript",
+              "java": "java", "kotlin": "java",
+              "python": "python", "ruby": "ruby", "php": "php",
+              "rust": "rust", "go": "go",
+          }
 
           def die(msg):
               print(f"::error::{msg}")
               sys.exit(1)
 
+          def api(path):
+              req = urllib.request.Request(
+                  "https://api.github.com" + path,
+                  headers={"Authorization": f"Bearer {TOKEN}",
+                           "Accept": "application/vnd.github+json"})
+              with urllib.request.urlopen(req, timeout=30) as r:
+                  return json.load(r)
+
           try:
               cfg = yaml.safe_load(open("levo-config.yml")) or {}
+          except FileNotFoundError:
+              cfg = {}
           except Exception as exc:
               die(f"levo-config.yml is not valid YAML: {exc}")
 
-          if cfg.get("version") != 1:
+          if cfg.get("version") not in (None, 1):
               die(f"Unsupported config version: {cfg.get('version')!r}. Expected 1.")
 
           defaults = cfg.get("defaults") or {}
-          env_name = str(defaults.get("env_name", "NonProd"))
+          env_name = str(defaults.get("env_name", "staging"))
           timeout = max(60, min(5400, int(defaults.get("scan_timeout", 1800))))
 
-          entries = []
-          for i, item in enumerate(cfg.get("repositories") or []):
+          # Per-repository overrides, keyed by "owner/name". Everything in here
+          # is optional; a repository with no entry still gets scanned.
+          overrides = {}
+          for item in (cfg.get("repositories") or []):
               repo = str(item.get("repo", ""))
-              lang = str(item.get("language", "")).lower()
-              app = str(item.get("app_name", "")) or repo.split("/")[-1]
-              if not REPO_RE.match(repo):
-                  die(f"repositories[{i}]: bad repo {repo!r}")
-              if not LANG_RE.match(lang):
-                  die(f"repositories[{i}]: bad language {lang!r}")
+              if repo:
+                  overrides[repo] = item
+
+          exclude = {str(x) for x in (cfg.get("exclude") or [])}
+          exclude.add(os.environ["CONTROL_REPO"])
+
+          # The Scan App's installation is the source of truth for scope. A
+          # repository listed in config but not granted cannot be scanned, and a
+          # repository granted but not listed still should be.
+          granted = api("/installation/repositories?per_page=100").get("repositories", [])
+          if not granted:
+              die("The Scan App has not been granted access to any repository.")
+
+          entries, skipped = [], []
+          for repo in granted:
+              full = repo["full_name"]
+              if full == os.environ["CONTROL_REPO"]:
+                  continue  # the control repo holds configuration, not an API
+              if full in exclude:
+                  skipped.append((full, "excluded in levo-config.yml"))
+                  continue
+              if repo.get("archived"):
+                  skipped.append((full, "archived"))
+                  continue
+
+              item = overrides.get(full, {})
+
+              lang = str(item.get("language", "")).strip().lower()
+              if not lang:
+                  try:
+                      langs = api(f"/repos/{full}/languages")
+                  except urllib.error.HTTPError as exc:
+                      skipped.append((full, f"could not read languages ({exc.code})"))
+                      continue
+                  if not langs:
+                      skipped.append((full, "GitHub reports no language for this repository"))
+                      continue
+                  lang = max(langs.items(), key=lambda kv: kv[1])[0].lower()
+
+              resolved = ALIASES.get(lang)
+              if resolved is None:
+                  skipped.append((full, f"language '{lang}' is not supported by the scanner"))
+                  continue
+
+              app = str(item.get("app_name", "")).strip() or repo["name"]
               if not NAME_RE.match(app):
-                  die(f"repositories[{i}]: bad app_name {app!r}")
+                  skipped.append((full, f"app_name {app!r} contains unsupported characters"))
+                  continue
+
               entries.append({
-                  "repo": repo, "owner": repo.split("/")[0],
-                  "name": repo.split("/")[1], "language": lang,
-                  "app_name": app, "env_name": env_name, "timeout": timeout,
+                  "repo": full, "owner": repo["owner"]["login"], "name": repo["name"],
+                  "language": resolved, "app_name": app,
+                  "env_name": env_name, "timeout": timeout,
               })
 
-          if not entries:
-              die("No repositories configured.")
+          print(f"{len(granted)} repository/repositories granted to the Scan App\n")
+          if entries:
+              print("Will scan:")
+              for e in entries:
+                  print(f"  {e['repo']:45} {e['language']:12} -> {e['app_name']}")
+          if skipped:
+              print("\nSkipped:")
+              for full, reason in skipped:
+                  print(f"  {full:45} {reason}")
 
-          # json.dumps cannot emit a newline, so a crafted config value cannot
-          # forge extra lines in $GITHUB_OUTPUT.
+          if not entries:
+              die("Nothing to scan. Grant the Scan App access to a repository, "
+                  "or check the skip reasons above.")
+
           with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
               fh.write(f"matrix={json.dumps({'include': entries})}\n")
               fh.write(f"count={len(entries)}\n")
-
-          print(f"{len(entries)} repository/repositories in scope:")
-          for e in entries:
-              print(f"  {e['repo']:45} {e['language']:12} -> {e['app_name']}")
           PY
 
   scan:
     needs: plan
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    # One repository failing must not fail the whole run.
+    # One repository failing must not fail the run (PRD FR-038, EC-14).
     continue-on-error: true
     strategy:
       fail-fast: false

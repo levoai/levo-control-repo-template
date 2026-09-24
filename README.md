@@ -67,9 +67,14 @@ In **this** repository: Settings → Secrets and variables → Actions.
 If your Levo tenant is not on `api.levo.ai`, add a **variable** (not a secret)
 named `LEVO_BASE_URL`.
 
-### 4. List your repositories
+### 4. Nothing to list
 
-Edit `levo-config.yml`. One entry per repository.
+What gets scanned is decided by step 2 -- the repositories you granted your Scan
+App access to. The language is read from GitHub's language statistics, and each
+application is named after its repository.
+
+`levo-config.yml` is there only if you want to override any of that, or exclude
+a repository the Scan App can see. You can leave it as it is.
 
 ### 5. Run it
 

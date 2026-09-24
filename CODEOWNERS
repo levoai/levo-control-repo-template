@@ -1,0 +1,6 @@
+# Require your own review on the files that control what Levo does.
+# Replace @your-org/platform-team with a real team before relying on this.
+
+/.github/workflows/   @your-org/platform-team
+/levo-config.yml      @your-org/platform-team
+/CODEOWNERS           @your-org/platform-team

@@ -1,0 +1,178 @@
+name: Levo scan
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 2 * * 1"
+
+concurrency:
+  group: levo-scan
+  cancel-in-progress: false
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      matrix: ${{ steps.build.outputs.matrix }}
+      count: ${{ steps.build.outputs.count }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Build the scan matrix from levo-config.yml
+        id: build
+        run: |
+          python3 - <<'PY'
+          import json, os, re, sys
+          import yaml
+
+          # levo-config.yml is writable by anyone with push access, so every
+          # value is untrusted. Validate against allowlists and fail closed
+          # (PRD FR-011) rather than passing junk into a shell or a job matrix.
+          REPO_RE = re.compile(r"^[A-Za-z0-9._-]{1,100}/[A-Za-z0-9._-]{1,100}$")
+          LANG_RE = re.compile(r"^[a-z+#]{1,12}$")
+          NAME_RE = re.compile(r"^[A-Za-z0-9 ._-]{1,80}$")
+
+          def die(msg):
+              print(f"::error::{msg}")
+              sys.exit(1)
+
+          try:
+              cfg = yaml.safe_load(open("levo-config.yml")) or {}
+          except Exception as exc:
+              die(f"levo-config.yml is not valid YAML: {exc}")
+
+          if cfg.get("version") != 1:
+              die(f"Unsupported config version: {cfg.get('version')!r}. Expected 1.")
+
+          defaults = cfg.get("defaults") or {}
+          env_name = str(defaults.get("env_name", "NonProd"))
+          timeout = max(60, min(5400, int(defaults.get("scan_timeout", 1800))))
+
+          entries = []
+          for i, item in enumerate(cfg.get("repositories") or []):
+              repo = str(item.get("repo", ""))
+              lang = str(item.get("language", "")).lower()
+              app = str(item.get("app_name", "")) or repo.split("/")[-1]
+              if not REPO_RE.match(repo):
+                  die(f"repositories[{i}]: bad repo {repo!r}")
+              if not LANG_RE.match(lang):
+                  die(f"repositories[{i}]: bad language {lang!r}")
+              if not NAME_RE.match(app):
+                  die(f"repositories[{i}]: bad app_name {app!r}")
+              entries.append({
+                  "repo": repo, "owner": repo.split("/")[0],
+                  "name": repo.split("/")[1], "language": lang,
+                  "app_name": app, "env_name": env_name, "timeout": timeout,
+              })
+
+          if not entries:
+              die("No repositories configured.")
+
+          # json.dumps cannot emit a newline, so a crafted config value cannot
+          # forge extra lines in $GITHUB_OUTPUT.
+          with open(os.environ["GITHUB_OUTPUT"], "a") as fh:
+              fh.write(f"matrix={json.dumps({'include': entries})}\n")
+              fh.write(f"count={len(entries)}\n")
+
+          print(f"{len(entries)} repository/repositories in scope:")
+          for e in entries:
+              print(f"  {e['repo']:45} {e['language']:12} -> {e['app_name']}")
+          PY
+
+  scan:
+    needs: plan
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    # One repository failing must not fail the run (PRD FR-038, EC-14).
+    continue-on-error: true
+    strategy:
+      fail-fast: false
+      max-parallel: 4
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Mint a clone token scoped to this repository only
+        id: clone-token
+        uses: actions/create-github-app-token@d72941d797fd3113feb6b93fd0dec494b13a2547 # v1
+        with:
+          app-id: ${{ secrets.SCAN_APP_ID }}
+          private-key: ${{ secrets.SCAN_APP_PRIVATE_KEY }}
+          owner: ${{ matrix.owner }}
+          repositories: ${{ matrix.name }}
+
+      - name: Negative control - token must not reach the control repo
+        env:
+          TOKEN: ${{ steps.clone-token.outputs.token }}
+          CONTROL_REPO: ${{ github.repository }}
+        run: |
+          code=$(curl -s -o /dev/null -w "%{http_code}" \
+            -H "Authorization: Bearer $TOKEN" \
+            "https://api.github.com/repos/$CONTROL_REPO")
+          echo "control repo via clone token -> HTTP $code (404 expected)"
+          [ "$code" = "404" ] || { echo "::error::Clone token is too broad."; exit 1; }
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: ${{ matrix.repo }}
+          token: ${{ steps.clone-token.outputs.token }}
+          path: product
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Scan and upload
+        env:
+          LEVO_AUTH_KEY: ${{ secrets.LEVO_AUTH_KEY }}
+          LEVO_ORG_ID: ${{ secrets.LEVO_ORG_ID }}
+          LEVO_BASE_URL: ${{ vars.LEVO_BASE_URL || 'https://api.levo.ai' }}
+          APP_NAME: ${{ matrix.app_name }}
+          ENV_NAME: ${{ matrix.env_name }}
+          LANGUAGE: ${{ matrix.language }}
+          SCAN_TIMEOUT: ${{ matrix.timeout }}
+        run: |
+          ARGS=(--language "$LANGUAGE" --scan-timeout "$SCAN_TIMEOUT")
+          if [ -n "$LEVO_AUTH_KEY" ]; then
+            echo "Upload mode: results go to $LEVO_BASE_URL as '$APP_NAME' / $ENV_NAME"
+            ARGS+=(--app-name "$APP_NAME" --env-name "$ENV_NAME" -k "$LEVO_AUTH_KEY" -o "$LEVO_ORG_ID")
+          else
+            echo "::notice::LEVO_AUTH_KEY not set - generating the spec locally only."
+            ARGS+=(--no-upload --output /workspace/levo-openapi.json)
+          fi
+          docker run --rm \
+            --user "$(id -u):$(id -g)" \
+            -e LEVO_BASE_URL -e LEVO_SCAN_TIMEOUT="$SCAN_TIMEOUT" \
+            -v "$PWD/product":/workspace:rw \
+            levoai/code-scanner:latest "${ARGS[@]}"
+
+      - name: Summarise what was discovered
+        if: always()
+        run: |
+          SPEC=$(find product \( -name 'levo-openapi.json' -o -name 'openapi_spec.json' \) 2>/dev/null | head -1)
+          if [ -z "$SPEC" ]; then echo "No spec produced."; exit 0; fi
+          python3 - "$SPEC" <<'PY'
+          import json, re, sys
+          spec = json.load(open(sys.argv[1]))
+          methods = {"get","put","post","delete","patch","head","options","trace"}
+          ops = [(p, m.upper()) for p, i in spec.get("paths", {}).items()
+                 for m in i if m.lower() in methods]
+          # A path derived from a source filename is not an endpoint. Counting
+          # them inflates every downstream number, including billing.
+          junk = re.compile(r"/(py|java|go|js|ts|rb|cs|php)$")
+          real = [o for o in ops if not junk.search(o[0])]
+          print(f"{len(real)} real operations ({len(ops) - len(real)} filename artefacts filtered)")
+          for path, method in sorted(real):
+              print(f"  {method:7} {path}")
+          PY
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: spec-${{ matrix.name }}
+          path: |
+            product/levo-openapi.json
+            product/scan-results/**/openapi_spec.json
+          if-no-files-found: warn

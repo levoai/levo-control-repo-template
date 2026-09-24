@@ -28,7 +28,7 @@ jobs:
 
           # levo-config.yml is writable by anyone with push access, so every
           # value is untrusted. Validate against allowlists and fail closed
-          # (PRD FR-011) rather than passing junk into a shell or a job matrix.
+          # rather than passing junk into a shell or a job matrix.
           REPO_RE = re.compile(r"^[A-Za-z0-9._-]{1,100}/[A-Za-z0-9._-]{1,100}$")
           LANG_RE = re.compile(r"^[a-z+#]{1,12}$")
           NAME_RE = re.compile(r"^[A-Za-z0-9 ._-]{1,80}$")
@@ -84,7 +84,7 @@ jobs:
     needs: plan
     runs-on: ubuntu-latest
     timeout-minutes: 45
-    # One repository failing must not fail the run (PRD FR-038, EC-14).
+    # One repository failing must not fail the whole run.
     continue-on-error: true
     strategy:
       fail-fast: false

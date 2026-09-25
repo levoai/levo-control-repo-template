@@ -65,6 +65,21 @@ jobs:
               with urllib.request.urlopen(req, timeout=30) as r:
                   return json.load(r)
 
+          def all_granted():
+              """Every page, not just the first. A single page silently caps
+              discovery at 100 repositories and drops the rest without a word."""
+              out, page = [], 1
+              while True:
+                  batch = api(f"/installation/repositories?per_page=100&page={page}")
+                  repos = batch.get("repositories", [])
+                  out.extend(repos)
+                  if len(repos) < 100:
+                      return out
+                  page += 1
+                  if page > 30:  # 3,000 repositories; far past any real installation
+                      print("::warning::Stopped paging at 3,000 repositories.")
+                      return out
+
           try:
               cfg = yaml.safe_load(open("levo-config.yml")) or {}
           except FileNotFoundError:
@@ -93,7 +108,7 @@ jobs:
           # The Scan App's installation is the source of truth for scope. A
           # repository listed in config but not granted cannot be scanned, and a
           # repository granted but not listed still should be.
-          granted = api("/installation/repositories?per_page=100").get("repositories", [])
+          granted = all_granted()
           if not granted:
               die("The Scan App has not been granted access to any repository.")
 

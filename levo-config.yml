@@ -19,7 +19,7 @@ exclude: []
   # - your-org/frontend-app
 
 # Per-repository overrides. Anything omitted is detected:
-#   language  - from GitHub's language statistics
+#   language  - the largest supported language in GitHub's language statistics
 #   app_name  - defaults to the repository name
 repositories: []
   # - repo: your-org/payments-api

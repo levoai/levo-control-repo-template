@@ -178,7 +178,14 @@ jobs:
                   if not langs:
                       skipped.append((full, "GitHub reports no language for this repository"))
                       continue
-                  lang = max(langs.items(), key=lambda kv: kv[1])[0].lower()
+                  # The largest language the scanner reads, not the largest
+                  # overall: HTML or a notebook can outweigh the API beside it.
+                  supported = {n: b for n, b in langs.items() if n.lower() in ALIASES}
+                  if not supported:
+                      top = max(langs.items(), key=lambda kv: kv[1])[0].lower()
+                      skipped.append((full, f"language '{top}' is not supported by the scanner"))
+                      continue
+                  lang = max(supported.items(), key=lambda kv: kv[1])[0].lower()
 
               resolved = ALIASES.get(lang)
               if resolved is None:

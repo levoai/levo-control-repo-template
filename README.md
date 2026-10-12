@@ -108,8 +108,10 @@ instead and add a variable named `LEVOAI_BASE_URL` with the value
 ### 4. Nothing to list
 
 What gets scanned is decided by step 2 -- the repositories you granted your Scan
-App access to. The language is read from GitHub's language statistics, and each
-application is named after its repository.
+App access to. The language is the largest one the scanner supports in GitHub's
+language statistics, and each application is named after its repository. If
+that language turns up no APIs -- a website beside an API in one repository,
+say -- the scanner tries the repository's next language by itself.
 
 `levo-config.yml` is there only if you want to override any of that, or exclude
 a repository the Scan App can see.

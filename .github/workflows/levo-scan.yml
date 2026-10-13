@@ -66,8 +66,8 @@ jobs:
         env:
           TOKEN: ${{ steps.levo-pass.outputs.token }}
         run: |
-          repo=$(curl -s -H "Authorization: Bearer $TOKEN" "https://api.github.com/installation/repositories?per_page=1" | jq -r '.repositories[0].full_name // empty')
-          [ -n "$repo" ] || exit 0
+          repo=$(curl -s -H "Authorization: Bearer $TOKEN" "https://api.github.com/installation/repositories?per_page=100" | jq -r '[(.repositories // [])[] | select(.private)][0].full_name // empty')
+          [ -n "$repo" ] || { echo "No private repository granted, so there is nothing to check."; exit 0; }
           code=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $TOKEN" "https://api.github.com/repos/$repo/contents/")
           echo "planning pass reading $repo contents -> HTTP $code (403 expected)"
           [ "$code" = "403" ] || [ "$code" = "404" ] || { echo "::error::The planning pass can read code."; exit 1; }
